@@ -201,13 +201,15 @@ class ConditioningItem:
         conditioning_strength (float): The strength of the conditioning (1.0 = full conditioning).
         media_x (Optional[int]): Optional left x coordinate of the media item in the generated frame.
         media_y (Optional[int]): Optional top y coordinate of the media item in the generated frame.
+        media_item_latents (Optional[torch.Tensor]): Pre-encoded latents. If provided, media_item encoding is skipped.
     """
 
-    media_item: torch.Tensor
-    media_frame_number: int
-    conditioning_strength: float
+    media_item: Optional[torch.Tensor] = None
+    media_frame_number: int = 0
+    conditioning_strength: float = 1.0
     media_x: Optional[int] = None
     media_y: Optional[int] = None
+    media_item_latents: Optional[torch.Tensor] = None
 
 
 class LTXVideoPipeline(DiffusionPipeline):
@@ -696,8 +698,14 @@ class LTXVideoPipeline(DiffusionPipeline):
             latents = noise
         else:
             # Noise the latents to the required (first) timestep
-            latents = timestep * noise + (1 - timestep) * latents
-
+            #latents = timestep * noise + (1 - timestep) * latents
+            if isinstance(timestep, torch.Tensor):
+                timestep = timestep.item()
+            latents = self.scheduler.add_noise(
+                original_samples=latents,
+                noise=noise,
+                timesteps=torch.tensor([timestep], device=device, dtype=dtype).float() # Use the value of the first timestep
+            )   
         return latents
 
     @staticmethod
@@ -1438,29 +1446,44 @@ class LTXVideoPipeline(DiffusionPipeline):
 
             # Process each conditioning item
             for conditioning_item in conditioning_items:
-                conditioning_item = self._resize_conditioning_item(
-                    conditioning_item, height, width
-                )
+                # Only resize if media_item is provided
+                if conditioning_item.media_item is not None:
+                    conditioning_item = self._resize_conditioning_item(
+                        conditioning_item, height, width
+                    )
+                
                 media_item = conditioning_item.media_item
                 media_frame_number = conditioning_item.media_frame_number
                 strength = conditioning_item.conditioning_strength
-                assert media_item.ndim == 5  # (b, c, f, h, w)
-                b, c, n_frames, h, w = media_item.shape
-                assert (
-                    height == h and width == w
-                ) or media_frame_number == 0, f"Dimensions do not match: {height}x{width} != {h}x{w} - allowed only when media_frame_number == 0"
-                assert n_frames % 8 == 1
+                
+                # Use pre-encoded latents if provided, otherwise encode the media item
+                if conditioning_item.media_item_latents is not None:
+                    media_item_latents = conditioning_item.media_item_latents.to(
+                        dtype=init_latents.dtype, device=init_latents.device
+                    )
+                    # Derive shape from latents
+                    b, c, n_frames, h, w = media_item_latents.shape
+                else:
+                    # Validate and encode the media item
+                    assert media_item is not None, "Either media_item or media_item_latents must be provided"
+                    assert media_item.ndim == 5  # (b, c, f, h, w)
+                    b, c, n_frames, h, w = media_item.shape
+                    assert (
+                        height == h and width == w
+                    ) or media_frame_number == 0, f"Dimensions do not match: {height}x{width} != {h}x{w} - allowed only when media_frame_number == 0"
+                    assert n_frames % 8 == 1
+                    
+                    # Encode the provided conditioning media item
+                    media_item_latents = vae_encode(
+                        media_item.to(dtype=self.vae.dtype, device=self.vae.device),
+                        self.vae,
+                        vae_per_channel_normalize=vae_per_channel_normalize,
+                    ).to(dtype=init_latents.dtype)
+                
                 assert (
                     media_frame_number >= 0
                     and media_frame_number + n_frames <= num_frames
                 )
-
-                # Encode the provided conditioning media item
-                media_item_latents = vae_encode(
-                    media_item.to(dtype=self.vae.dtype, device=self.vae.device),
-                    self.vae,
-                    vae_per_channel_normalize=vae_per_channel_normalize,
-                ).to(dtype=init_latents.dtype)
 
                 # Handle the different conditioning cases
                 if media_frame_number == 0:
@@ -1616,7 +1639,16 @@ class LTXVideoPipeline(DiffusionPipeline):
         (border latents look different then other latents and might confuse the model)
         """
         scale = self.vae_scale_factor
-        h, w = conditioning_item.media_item.shape[-2:]
+        
+        # Get dimensions from media_item if provided, otherwise from latents
+        if conditioning_item.media_item is not None:
+            h, w = conditioning_item.media_item.shape[-2:]
+        else:
+            # Derive pixel dimensions from latent dimensions
+            h_l, w_l = latents.shape[-2:]
+            h = h_l * scale
+            w = w_l * scale
+        
         assert (
             h <= height and w <= width
         ), f"Conditioning item size {h}x{w} is larger than target size {height}x{width}"
